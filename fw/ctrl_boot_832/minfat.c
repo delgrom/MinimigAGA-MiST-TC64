@@ -69,6 +69,11 @@ unsigned long fat_size;                 // size of fat
 
 unsigned char sector_buffer[512];       // sector buffer
 
+#define EXFAT_READ sd_read_sector
+#define EXFAT_BUFFER sector_buffer
+#include "../exfat.h"
+static int exfat;
+
 //unsigned char *sector_buffer=0x18000;
 
 //struct PartitionEntry partitions[4]; 	// [4];	// lbastart and sectors will be byteswapped as necessary
@@ -97,8 +102,10 @@ int compare(const char *s1, const char *s2,int b)
 unsigned char FindDrive(void)
 {
 	unsigned long boot_sector;              // partition boot sector
+    unsigned long partition_sectors = 0;
     buffered_fat_index = -1;
 	fat32=0;
+	exfat=0;
 
 	puts("Reading MBR\n");
 
@@ -114,6 +121,8 @@ unsigned char FindDrive(void)
 	partitioncount=1;
 
 	// If we can identify a filesystem on block 0 we don't look for partitions
+    if (ExfatSignature(sector_buffer))
+		partitioncount=0;
     if (compare((const char*)&sector_buffer[0x36], "FAT16   ",8)==0) // check for FAT16
 		partitioncount=0;
     if (compare((const char*)&sector_buffer[0x52], "FAT32   ",8)==0) // check for FAT32
@@ -129,24 +138,23 @@ unsigned char FindDrive(void)
 
 	if(partitioncount)
 	{
-		// We have at least one partition, parse the MBR.
-		struct MasterBootRecord *mbr=(struct MasterBootRecord *)sector_buffer;
-		struct PartitionEntry *pe=(struct PartitionEntry*)&mbr->Partition[0][0];
-//		hexdump(sector_buffer,512);
-		boot_sector = pe->startlba;
-		if(mbr->Signature==0x55aa)
-				boot_sector=SwapBBBB(pe->startlba);
-		else if(mbr->Signature!=0xaa55)
-		{
-			puts("No partition signature found\n");
-			return(0);
-		}
+        if (sector_buffer[510] != 0x55 || sector_buffer[511] != 0xaa)
+        {
+            puts("No partition signature found\n");
+            return 0;
+        }
+        boot_sector = ExfatLE32(sector_buffer + 454);
+        partition_sectors = ExfatLE32(sector_buffer + 458);
 		printf("Reading boot sector %d\n",boot_sector);
 		if (!sd_read_sector(boot_sector, sector_buffer)) // read discriptor
 		    return(0);
 		puts("Read boot sector from first partition\n");
 	}
 //	hexdump(sector_buffer,512);
+
+    if (ExfatSignature(sector_buffer))
+        return exfat = ExfatMount(boot_sector) &&
+            (!partitioncount || ExfatLE32(sector_buffer + 72) <= partition_sectors);
 
 	printf("Hunting for filesystem\n");
 
@@ -344,8 +352,60 @@ unsigned char FileRead(fileTYPE *file, unsigned char *pBuffer)
 
 fileTYPE file;
 
+static unsigned long LoadExfatFirmware(const char *short_name, unsigned char *buf)
+{
+    ExfatDirectory dir;
+    ExfatEntry entry;
+    char name[256], requested[13];
+    unsigned int i = 0, end = 8;
+
+    while (end && short_name[end - 1] == ' ')
+        --end;
+    while (i < end)
+    {
+        requested[i] = short_name[i];
+        ++i;
+    }
+    if (short_name[8] != ' ')
+        requested[i++] = '.';
+    for (end = 8; end < 11 && short_name[end] != ' '; ++end)
+        requested[i++] = short_name[end];
+    requested[i] = 0;
+
+    ExfatOpenDirectory(&dir, 0, 0);
+    while (ExfatNextEntry(&dir, &entry, name))
+    {
+        if (!(entry.attributes & ATTR_DIRECTORY) && ExfatNameEqual(name, requested))
+        {
+            unsigned long left, offset = 0;
+            /* The OSD program area ends where its audio buffers begin. */
+            if (entry.size_high || !entry.size || entry.size > 0x70000UL - prg_start)
+                return 0;
+            left = ((entry.size - 1) >> 9) + 1;
+            while (left)
+            {
+                if (!sd_read_sector(ExfatSector(entry.cluster) + offset, buf))
+                    return 0;
+                --left;
+                buf += 512;
+                if (++offset == exfat_cluster_sectors && left)
+                {
+                    entry.cluster = ExfatNextCluster(entry.cluster);
+                    if (!entry.cluster)
+                        return 0;
+                    offset = 0;
+                }
+            }
+            return entry.size;
+        }
+    }
+    return 0;
+}
+
 int LoadFile(const char *fn, unsigned char *buf)
 {
+    if (exfat)
+        return LoadExfatFirmware(fn, buf);
 	if(FileOpen(&file,fn))
 	{
 //		puts("Opened file, loading...\n");

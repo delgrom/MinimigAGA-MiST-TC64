@@ -19,7 +19,8 @@ typedef struct
     unsigned char attributes;      /* file attributes */
     entryTYPE     entry;           /* file entry location */
     unsigned long sector;          /* sector index in file */
-    unsigned long size;            /* file size */
+    unsigned long size;            /* low 32 bits of file size in bytes */
+    unsigned long size_high;       /* high 32 bits of file size in bytes */
     unsigned long cluster;         /* current cluster */
     unsigned long start_cluster;   /* first cluster of file */
     char          long_name[261];
@@ -83,7 +84,7 @@ typedef union {
 // global sector buffer, data for read/write actions is stored here.
 // BEWARE, this buffer is also used and thus trashed by all other functions
 extern unsigned char sector_buffer[1024]; // sector buffer - room for 2 sectors, to ease reading data not sector-aligned...
-extern unsigned char cluster_size;
+extern unsigned long cluster_size;
 extern unsigned long cluster_mask;
 extern unsigned char fat32;
 
@@ -128,6 +129,10 @@ unsigned long FindDirectoryByCluster(unsigned long parent, unsigned long cluster
 unsigned int FileCreate(unsigned long iDirectory, fileTYPE *file);
 unsigned int UpdateEntry(fileTYPE *file);
 
+/* SD I/O remains sector-addressed with 32-bit LBAs. */
+#define FileSectorCount(file) (((file)->size_high << 23) | ((file)->size >> 9))
+void FileSetDirectorySize(fileTYPE *file, const DIRENTRY *entry);
+unsigned long DirectoryEntryCluster(const DIRENTRY *entry);
 int ScanDirectory(unsigned long mode, char *extension, unsigned char options);
 void ChangeDirectory(unsigned long iStartCluster);
 

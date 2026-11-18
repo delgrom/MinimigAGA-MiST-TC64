@@ -36,6 +36,31 @@ PS/2 mice, Turbo Chameleon Docking Station for extra joysticks or real Amiga mou
 ### Hardware
 To use this minimig core, you will at the minimum need an SD/SDHC card, formatted with the FAT32 filesystem, a PS/2 keyboard and a compatible monitor / TV. Joysticks & mouse can be emulated on the keyboard. You will probably want to attach a set of speakers or headphones, a real Amiga or USB mouse and a real Amiga joystick.
 
+### UnAmiga SD cards
+
+UnAmiga builds with exFAT support can boot from FAT16, FAT32 or exFAT. For
+exFAT, use a volume with 512-byte sectors, either directly on the card or as
+the first primary partition in an MBR. Put the matching `832OSDAD.BIN`
+and `KICK.ROM` in the root directory.
+
+The OSD can browse subdirectories and read and write existing disk images,
+including fragmented images. HDF images on exFAT can exceed 4 GiB. The IDE
+controller uses LBA28 for large images, with a maximum capacity of
+268,435,455 sectors (just under 128 GiB), including any synthesized RDB
+sectors. To use the full image, the Amiga IDE driver and filesystem must
+also support access beyond 4 GiB. Image files must be fully initialized.
+
+To save an OSD configuration on exFAT, copy an existing configuration
+file from a FAT card first. The firmware can overwrite an existing file of the same size, while
+file creation and resizing must be done on a computer.
+
+To build, compile the EightThirtyTwo toolchain and libraries with
+`make -C EightThirtyTwo toolchain vbcc library`. With `vasmm68k_mot` on
+the PATH, run `make -C fw/ctrl_boot_832` and `make -C fw/ctrl_832`.
+The first command regenerates the boot ROM included by
+`fpga/unamiga/minimig_unamiga.qpf`. Compile that project in Quartus and copy
+the second command's `fw/ctrl_832/832OSDAD.bin` to the card.
+
 ### Software
 
 To use the core, you will also need a Kickstart ROM image file, which you can obtain by copying Kickstart ROM IC from your actual Amiga, or by buying an [Amiga Forever](http://www.amigaforever.com/) software pack. The Kickstart image should be placed on the root of the SD card with the name KICK.ROM. Minimig also supports the [AROS](http://aros.sourceforge.net/) Kickstart ROM replacement.

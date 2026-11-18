@@ -185,7 +185,9 @@ void ReadTrack(adfTYPE *drive)
 	// (Body Blows AGA reads from all connected drives without checking whether they're empty.)
     if (drive->status & DSK_INSERTED)
     {
-    	file.size = drive->filesize; /* FIXME - each floppy image should have its own file structure */
+        file.size_high = 0;
+        file.size = drive->filesize; /* FIXME - each floppy image should have its own file structure */
+    file.attributes = drive->status & DSK_WRITABLE ? 0 : ATTR_READONLY;
     
     	if(drive->track >= drive->tracks)
 		{
@@ -618,7 +620,8 @@ void WriteTrack(adfTYPE *drive)
     // setting file pointer to begining of current track
     file.cluster = drive->cache[drive->track];
     file.sector = drive->track * 11;
-   	file.size = drive->filesize; /* FIXME - each floppy image should have its own file structure */
+    file.size_high = 0;
+        file.size = drive->filesize; /* FIXME - each floppy image should have its own file structure */
     sector = 0;
 
 	// So much havok for such an innocent looking bug.

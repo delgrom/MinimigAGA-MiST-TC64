@@ -54,7 +54,7 @@ void WriteTaskFile(int error,int sector_count,int sector_number,int cylinder_low
 void WriteStatus(unsigned int status);
 void HandleHDD(unsigned int c1, unsigned int c2);
 void GetHardfileGeometry(hdfTYPE *hdf);
-void BuildHardfileIndex(hdfTYPE *hdf);
+unsigned char BuildHardfileIndex(hdfTYPE *hdf);
 unsigned char HardFileSeek(hdfTYPE *hdf, unsigned long lba);
 unsigned char OpenHardfile(unsigned int unit);
 
@@ -63,7 +63,7 @@ unsigned char OpenHardfile(unsigned int unit);
 #define HDF_FILETYPE_RDB 2
 #define HDF_FILETYPE_DOS 3
 
-unsigned char GetHDFFileType(char *filename);
+unsigned char GetHDFFileType(const char *short_name);
 
 extern char debugmsg[40];
 extern char debugmsg2[40];

@@ -66,12 +66,19 @@ unsigned long root_directory_cluster;   // root directory cluster (used in FAT32
 unsigned long root_directory_start;     // start LBA of directory table
 unsigned long root_directory_size;      // size of directory region in sectors
 unsigned char fat_number;               // number of FAT tables
-unsigned char cluster_size;             // size of a cluster in sectors
+unsigned long cluster_size;             // size of a cluster in sectors
 unsigned long cluster_mask;             // binary mask of cluster number
 unsigned short dir_entries;             // number of entry's in directory table
 unsigned long fat_size;                 // size of fat
 
 unsigned char sector_buffer[1024];       // sector buffer - room for two consecutive sectors...
+
+static unsigned char exfat_buffer[512];
+#define EXFAT_READ MMC_Read
+#define EXFAT_BUFFER exfat_buffer
+#include "../exfat.h"
+static int exfat;
+int _strnicmp(const char *s1, const char *s2, size_t n);
 
 struct PartitionEntry partitions[4];	// lbastart and sectors will be byteswapped as necessary
 int partitioncount;
@@ -95,13 +102,6 @@ unsigned char t_sort_table[MAXDIRENTRIES];
 // external functions
 extern unsigned long GetTimer(unsigned long);
 
-void SwapPartitionBytes(int i)
-{
-	// We don't bother to byteswap the CHS geometry fields since we don't use them.
-	partitions[i].startlba=SwapBBBB(partitions[i].startlba);
-	partitions[i].sectors=SwapBBBB(partitions[i].sectors);
-}
-
 extern char BootPrint(const char *s);
 void bprintfl(const char *fmt,unsigned long l)
 {
@@ -116,6 +116,7 @@ void bprintfl(const char *fmt,unsigned long l)
 unsigned int FindDrive(void)
 {
     buffered_fat_index = -1;
+    fattype = fat32 = exfat = 0;
 
 	int i;
 
@@ -126,6 +127,8 @@ unsigned int FindDrive(void)
 	partitioncount=1;
 
 	// If we can identify a filesystem on block 0 we don't look for partitions
+    if (ExfatSignature(sector_buffer))
+        partitioncount=0;
     if (strncmp((const char*)&sector_buffer[0x36], "FAT16   ", 8)==0) // check for FAT16
 		partitioncount=0;
     if (strncmp((const char*)&sector_buffer[0x52], "FAT32   ", 8)==0) // check for FAT32
@@ -133,52 +136,41 @@ unsigned int FindDrive(void)
 
 	if(partitioncount)
 	{
-		// We have at least one partition, parse the MBR.
-		struct MasterBootRecord *mbr=(struct MasterBootRecord *)sector_buffer;
-		if(DEBUG)
-			BootPrint("Copying partitions");
-		memcpy(&partitions[0],&mbr->Partition[0],sizeof(struct PartitionEntry));
-		memcpy(&partitions[1],&mbr->Partition[1],sizeof(struct PartitionEntry));
-		memcpy(&partitions[2],&mbr->Partition[2],sizeof(struct PartitionEntry));
-		memcpy(&partitions[3],&mbr->Partition[3],sizeof(struct PartitionEntry));
+        if (sector_buffer[510] != 0x55 || sector_buffer[511] != 0xaa)
+        {
+            SetError(ERROR_FILESYSTEM, "No partition signature found", 0, 0);
+            return 0;
+        }
 
-		switch(mbr->Signature)
-		{
-			case 0x55aa:	// Little-endian MBR on a big-endian system
-				if(DEBUG)
-					BootPrint("Swapping byte order of partition entries");
-				SwapPartitionBytes(0);
-				SwapPartitionBytes(1);
-				SwapPartitionBytes(2);
-				SwapPartitionBytes(3);
-				// fall through...
-			case 0xaa55:
-				// get start of first partition
-				boot_sector = partitions[0].startlba;
-				bprintfl("Start: %ld\n",partitions[0].startlba);
-				for(partitioncount=4;(partitions[partitioncount-1].sectors==0) && (partitioncount>1); --partitioncount)
-					;
-				bprintfl("PartitionCount: %ld\n",partitioncount);
-				int i;
-				for(i=0;i<partitioncount;++i)
-				{
-					bprintfl("Partition: %ld",i);
-					bprintfl("  Start: %ld",partitions[i].startlba);
-					bprintfl("  Size: %ld\n",partitions[i].sectors);
-				}
-//				WaitTimer(5000);
-				if (!MMC_Read(boot_sector, sector_buffer)) // read discriptor
-				    return(0);
-				if(DEBUG)
-					BootPrint("Read boot sector from first partition\n");
-				break;
-			default:
-				SetError(ERROR_FILESYSTEM,"No partition signature found",mbr->Signature,0);
-				if(DEBUG)
-					BootPrintEx("No partition signature found\n");
-				break;
-		}
-	}
+        for (i = 0; i < 4; ++i)
+        {
+            const unsigned char *entry = sector_buffer + 446 + i * 16;
+            memcpy(partitions[i].geometry, entry, sizeof(partitions[i].geometry));
+            partitions[i].startlba = ExfatLE32(entry + 8);
+            partitions[i].sectors = ExfatLE32(entry + 12);
+        }
+        boot_sector = partitions[0].startlba;
+        for (partitioncount = 4; partitioncount > 1 && !partitions[partitioncount - 1].sectors;
+             --partitioncount)
+            ;
+        if (!MMC_Read(boot_sector, sector_buffer))
+            return 0;
+    }
+
+    if (ExfatSignature(sector_buffer))
+    {
+        memcpy(exfat_buffer, sector_buffer, 512);
+        if (!ExfatMount(boot_sector) ||
+            (partitioncount && ExfatLE32(exfat_buffer + 72) > partitions[0].sectors))
+        {
+            FatalError(ERROR_FILESYSTEM, "Unsupported exFAT volume", 0, 0);
+            return 0;
+        }
+        exfat = 1;
+        cluster_size = exfat_cluster_sectors;
+        cluster_mask = ~(cluster_size - 1);
+        return 1;
+    }
 
     if (strncmp((const char*)&sector_buffer[0x36], "FAT16   ", 8)==0) // check for FAT16
 		fattype = 16;
@@ -337,6 +329,157 @@ static int doLFN(DIRENTRY *pEntry,char *lfnbuf)
 }
 
 
+/* exFAT has no on-disk ".." entries. Resolve persisted directory cluster IDs
+ * from the root, keeping only the cursors for the current path. */
+static int ExfatLocateDirectory(unsigned long id, unsigned long *size, unsigned long *parent)
+{
+    static struct {
+        ExfatDirectory cursor;
+        unsigned long id;
+    } path[32];
+    unsigned int depth = 0;
+    ExfatEntry entry;
+    char name[256];
+
+    *size = *parent = 0;
+    if (!id)
+        return 1;
+    path[0].id = 0;
+    ExfatOpenDirectory(&path[0].cursor, 0, 0);
+    for (;;)
+    {
+        if (!ExfatNextEntry(&path[depth].cursor, &entry, name))
+        {
+            if (!depth)
+                return 0;
+            --depth;
+            continue;
+        }
+        if (!(entry.attributes & ATTR_DIRECTORY) || !entry.size || (entry.size & 511))
+            continue;
+        if (entry.cluster == id)
+        {
+            *size = entry.size;
+            *parent = path[depth].id;
+            return 1;
+        }
+        if (depth + 1 < sizeof(path) / sizeof(path[0]))
+        {
+            unsigned int ancestor;
+            for (ancestor = 0; ancestor <= depth; ++ancestor)
+                if (path[ancestor].cursor.cluster == entry.cluster || path[ancestor].id == entry.cluster)
+                    break;
+            if (ancestor <= depth || (entry.cluster & EXFAT_CLUSTER_MASK) == exfat_root)
+                continue;
+            ++depth;
+            path[depth].id = entry.cluster;
+            ExfatOpenDirectory(&path[depth].cursor, entry.cluster, entry.size);
+        }
+    }
+}
+
+static int ExfatDirectoryAt(ExfatDirectory *dir, unsigned long cluster, unsigned long *parent)
+{
+    unsigned long size;
+    if (!ExfatLocateDirectory(cluster, &size, parent))
+        return 0;
+    ExfatOpenDirectory(dir, cluster, size);
+    return 1;
+}
+
+/* Existing OSD configuration records store an 11-byte FAT-style name.
+ * Preserve plain 8.3 names and use a cluster-based alias for longer names. */
+static void ExfatAlias(unsigned char *alias, const char *name, unsigned long cluster)
+{
+    const char *ext = 0, *p;
+    for (p = name; *p; ++p)
+        if (*p == '.')
+            ext = p;
+    unsigned int base = ext ? ext - name : strlen(name);
+    unsigned int i;
+    int short_name = base > 0 && base <= 8 && name[0] != '~';
+
+    memset(alias, ' ', 11);
+    for (i = 0; i < base && short_name; ++i)
+    {
+        unsigned char c = ExfatUpper(name[i]);
+        if (c <= ' ' || c >= 127 || c == '.' || c == '?')
+            short_name = 0;
+        alias[i] = c;
+    }
+    if (!short_name || (ext && strlen(ext + 1) > 3))
+    {
+        alias[0] = '~';
+        cluster &= EXFAT_CLUSTER_MASK;
+        for (i = 8; i > 1;)
+        {
+            unsigned int digit = cluster & 31;
+            alias[--i] = digit < 10 ? '0' + digit : 'A' + digit - 10;
+            cluster >>= 5;
+        }
+    }
+    if (ext && strlen(ext + 1) <= 3)
+        for (i = 0; i < 3 && ext[i + 1]; ++i)
+            alias[8 + i] = ExfatUpper(ext[i + 1]);
+}
+
+unsigned long DirectoryEntryCluster(const DIRENTRY *entry)
+{
+    unsigned long high = exfat ? entry->HighCluster : (fat32 ? entry->HighCluster & 0x0fff : 0);
+    return (high << 16) | entry->StartCluster;
+}
+
+void FileSetDirectorySize(fileTYPE *file, const DIRENTRY *entry)
+{
+    file->size_high = exfat ? entry->CreateTime : 0;
+    file->size = entry->FileSize;
+}
+
+static void ExfatMenuEntry(DIRENTRY *result, const ExfatEntry *entry, const char *name)
+{
+    memset(result, 0, sizeof(*result));
+    ExfatAlias((unsigned char *)result, name, entry->cluster);
+    result->HighCluster = entry->cluster >> 16;
+    result->StartCluster = entry->cluster;
+    result->Attributes = entry->attributes;
+    /* The OSD's synthesized entries can reuse the FAT creation time field.
+     * Actual FAT directory entries keep their standard 32-byte layout. */
+    result->CreateTime = entry->size_high;
+    result->FileSize = entry->size;
+}
+
+static unsigned int ExfatFileOpen(fileTYPE *file, const char *name)
+{
+    ExfatDirectory dir;
+    ExfatEntry entry;
+    unsigned long parent;
+    char long_name[256];
+    unsigned char alias[11];
+
+    if (ExfatDirectoryAt(&dir, iCurrentDirectory, &parent))
+        while (ExfatNextEntry(&dir, &entry, long_name))
+        {
+            if (entry.attributes & ATTR_DIRECTORY)
+                continue;
+            ExfatAlias(alias, long_name, entry.cluster);
+            if (ExfatNameEqual(name, long_name) ||
+                (strlen(name) == 11 && !_strnicmp(name, (const char *)alias, 11)))
+            {
+                memset(file, 0, sizeof(*file));
+                memcpy(file->name, alias, sizeof(file->name));
+                strcpy(file->long_name, long_name);
+                file->attributes = entry.attributes;
+                file->size = entry.size;
+                file->size_high = entry.size_high;
+                file->cluster = file->start_cluster = entry.cluster;
+                return 1;
+            }
+        }
+    memset(file, 0, sizeof(*file));
+    SetError(ERROR_FILESYSTEM, "File not found", 0, 0);
+    return 0;
+}
+
 unsigned int FileOpen(fileTYPE *file, const char *name)
 {
 //    unsigned long  iDirectory = 0;       // only root directory is supported
@@ -345,6 +488,9 @@ unsigned int FileOpen(fileTYPE *file, const char *name)
     unsigned long  iDirectoryCluster;    // start cluster of subdirectory or FAT32 root directory
     unsigned long  iEntry;               // entry index in directory cluster or FAT16 root directory
     unsigned long  nEntries;             // number of entries per cluster or FAT16 root directory size
+
+    if (exfat)
+        return ExfatFileOpen(file, name);
 
     if (iCurrentDirectory) // subdirectory
     {
@@ -386,6 +532,7 @@ unsigned int FileOpen(fileTYPE *file, const char *name)
                         strncpy(file->name, (const char*)pEntry->Name, sizeof(file->name));
                         file->attributes = pEntry->Attributes;
 //                        file->size = pEntry->FileSize; 																		// it only works when using little endian long representation
+                        file->size_high = 0;
                         file->size = SwapBBBB(pEntry->FileSize); 		// for 68000
 //                        file->size = ((file->size>>24)&0xFF)|((file->size>>8)&0xFF00)|((file->size<<8)&0xFF0000)|((file->size<<24)&0xFF000000); // for 68000 
 //                        file->start_cluster = pEntry->StartCluster + (fat32 ? (pEntry->HighCluster & 0x0FFF) << 16 : 0); 	// it only works when using little endian long representation
@@ -436,6 +583,11 @@ int ValidateDirectory(unsigned long directory)
     unsigned long  iDirectorySector;     // current sector of directory entries table
     unsigned long  iDirectoryCluster;    // start cluster of subdirectory or FAT32 root directory
     unsigned long  iEntry;               // entry index in directory cluster or FAT16 root directory
+    if (exfat)
+    {
+        unsigned long size, parent;
+        return ExfatLocateDirectory(directory, &size, &parent);
+    }
 
 	if(!directory || (directory==root_directory_cluster))
 	{
@@ -477,6 +629,12 @@ unsigned long FindDirectoryByCluster(unsigned long parent, unsigned long cluster
     unsigned long  iDirectoryCluster;    // start cluster of subdirectory or FAT32 root directory
     unsigned long  iEntry;               // entry index in directory cluster or FAT16 root directory
     unsigned long  nEntries;             // number of entries per cluster or FAT16 root directory size
+    if (exfat)
+    {
+        unsigned long size, actual_parent;
+        return cluster && ExfatLocateDirectory(cluster, &size, &actual_parent) &&
+               parent == actual_parent;
+    }
 
     if (parent) // subdirectory
     {
@@ -544,6 +702,18 @@ unsigned long FindDirectory(unsigned long parent, const char *name)
     unsigned long  iDirectoryCluster;    // start cluster of subdirectory or FAT32 root directory
     unsigned long  iEntry;               // entry index in directory cluster or FAT16 root directory
     unsigned long  nEntries;             // number of entries per cluster or FAT16 root directory size
+    if (exfat)
+    {
+        ExfatDirectory dir;
+        ExfatEntry entry;
+        unsigned long grandparent;
+        char long_name[256];
+        if (ExfatDirectoryAt(&dir, parent, &grandparent))
+            while (ExfatNextEntry(&dir, &entry, long_name))
+                if ((entry.attributes & ATTR_DIRECTORY) && ExfatNameEqual(name, long_name))
+                    return entry.cluster;
+        return 0;
+    }
 
     if (parent) // subdirectory
     {
@@ -639,6 +809,14 @@ int CompareDirEntries(DIRENTRY *pDirEntry1, char *pLFN1, DIRENTRY *pDirEntry2, c
     int len;
     int rc;
 
+    if (exfat)
+    {
+        int parent1 = !memcmp(pDirEntry1->Name, "..      ", 8);
+        int parent2 = !memcmp(pDirEntry2->Name, "..      ", 8);
+        if (parent1 != parent2)
+            return parent2 - parent1;
+    }
+
     if ((pDirEntry1->Attributes & ATTR_DIRECTORY) && !(pDirEntry2->Attributes & ATTR_DIRECTORY)) // directories first
        return -1;
 
@@ -677,11 +855,17 @@ int CompareDirEntries(DIRENTRY *pDirEntry1, char *pLFN1, DIRENTRY *pDirEntry2, c
                 rc = -1;
         }
     }
+    if (exfat && !rc)
+        rc = memcmp(pDirEntry1, pDirEntry2, 11);
     return(rc);
 }
 
 int ScanDirectory(unsigned long mode, char *extension, unsigned char options)
 {
+    ExfatDirectory exfat_dir;
+    DIRENTRY exfat_entry;
+    unsigned long parent = 0;
+    int parent_pending = 0;
     DIRENTRY *pEntry = NULL;            // pointer to current entry in sector buffer
     unsigned long iDirectorySector;     // current sector of directory entries table
     unsigned long iDirectoryCluster;
@@ -762,7 +946,14 @@ int ScanDirectory(unsigned long mode, char *extension, unsigned char options)
         find_dir = options & FIND_DIR;
     }
 
-    if (iCurrentDirectory) // subdirectory
+    if (exfat)
+    {
+        if (!ExfatDirectoryAt(&exfat_dir, iCurrentDirectory, &parent))
+            return 0;
+        parent_pending = iCurrentDirectory != 0;
+        nEntries = 0;
+    }
+    else if (iCurrentDirectory) // subdirectory
     {
 		printf("Scanning directory %x\n",iCurrentDirectory);
         iDirectoryCluster = iCurrentDirectory;
@@ -779,9 +970,32 @@ int ScanDirectory(unsigned long mode, char *extension, unsigned char options)
 
     while (1)
     {
-        for (iEntry = 0; iEntry < nEntries; iEntry++)
+        for (iEntry = 0; exfat || iEntry < nEntries; iEntry++)
         {
-            if ((iEntry & 0xF) == 0) // first entry in sector, load the sector
+            if (exfat)
+            {
+                ExfatEntry entry;
+                if (parent_pending)
+                {
+                    parent_pending = 0;
+                    memset(&exfat_entry, 0, sizeof(exfat_entry));
+                    memcpy(exfat_entry.Name, "..         ", 11);
+                    exfat_entry.Attributes = ATTR_DIRECTORY;
+                    exfat_entry.StartCluster = parent;
+                    exfat_entry.HighCluster = parent >> 16;
+                }
+                else
+                {
+                    if (!ExfatNextEntry(&exfat_dir, &entry, lfn))
+                        break;
+                    if (!entry.size && !entry.size_high)
+                        continue;
+                    ExfatMenuEntry(&exfat_entry, &entry, lfn);
+                    name_checksum = lfn_checksum(exfat_entry.Name);
+                }
+                pEntry = &exfat_entry;
+            }
+            else if ((iEntry & 0xF) == 0) // first entry in sector, load the sector
             {
                 if(!MMC_Read(iDirectorySector++, sector_buffer))
 					return(0);
@@ -902,7 +1116,7 @@ int ScanDirectory(unsigned long mode, char *extension, unsigned char options)
                             }
                             else if (mode == SCAN_INIT_FIRST)
                             { // find a dir entry with given cluster number and store it in the buffer
-                                if (pEntry->StartCluster + (fat32 ? (pEntry->HighCluster & 0x0FFF) << 16 : 0) == iPreviousDirectory)
+                                if (DirectoryEntryCluster(pEntry) == iPreviousDirectory)
                                 { // directory entry found
                                     for (i = 0; i< MAXDIRENTRIES; i++)
                                         sort_table[i] = i; // init sorting table
@@ -1217,6 +1431,8 @@ int ScanDirectory(unsigned long mode, char *extension, unsigned char options)
                 }
             }
         }
+        if (exfat)
+            break;
         if (iCurrentDirectory || fat32) // subdirectory is a linked cluster chain
         {
             iDirectoryCluster = GetFATLink(iDirectoryCluster); // get next cluster in chain
@@ -1351,20 +1567,71 @@ unsigned long GetFATLink(unsigned long cluster)
     return(fat32 ? SwapBBBB(fat_buffer.fat32[buffer_index]) & 0x0FFFFFFF : SwapBB(fat_buffer.fat16[buffer_index])); // get FAT link for 68000
 }
 
+static unsigned int ExfatSeek(fileTYPE *file, unsigned long offset)
+{
+    unsigned long cluster = file->cluster;
+    unsigned long target = offset & cluster_mask;
+    unsigned long current = file->sector & cluster_mask;
+
+    unsigned long sectors = FileSectorCount(file);
+
+    if (offset > sectors)
+        return 0;
+    /* An aligned EOF has no sector to map. Keep the last cluster there. */
+    if (sectors && !(file->size & 511))
+    {
+        if (offset == sectors)
+            target = (offset - 1) & cluster_mask;
+        if (file->sector == sectors)
+            current = (file->sector - 1) & cluster_mask;
+    }
+    if (cluster & EXFAT_CONTIGUOUS)
+    {
+        cluster = target >= current ? cluster + (target - current) / cluster_size :
+                                       cluster - (current - target) / cluster_size;
+        if (!ExfatValidCluster(cluster))
+            return 0;
+    }
+    else
+    {
+        if (current > target)
+        {
+            cluster = file->start_cluster;
+            current = 0;
+        }
+        while (current < target)
+        {
+            cluster = ExfatNextCluster(cluster);
+            if (!cluster)
+                return 0;
+            current += cluster_size;
+        }
+    }
+    file->cluster = cluster;
+    file->sector = offset;
+    return 1;
+}
+
 #pragma section_code_init
 RAMFUNC unsigned int FileNextSector(fileTYPE *file)
 {
     unsigned long sb;
     unsigned short i;
 
+    if (exfat)
+        return ExfatSeek(file, file->sector + 1);
+
     // increment sector index
     file->sector++;
 
-	if(file->sector > (file->size>>9))	// Attempt to seek beyond the end of the file
+	if(file->sector > FileSectorCount(file))	// Attempt to seek beyond the end of the file
 	{
-		FatalError(ERROR_FILESYSTEM,"NextSector() beyond end of file",file->sector,file->size>>9);
+		FatalError(ERROR_FILESYSTEM,"NextSector() beyond end of file",file->sector,FileSectorCount(file));
 		return(0);
 	}
+
+    if (file->sector == FileSectorCount(file) && !(file->size & 511))
+        return 1;
 
     // cluster's boundary crossed?
     if ((file->sector&~cluster_mask) == 0)
@@ -1402,78 +1669,64 @@ unsigned int FileSeek(fileTYPE *file, unsigned long offset, unsigned long origin
 // offset in sectors (512 bytes)
 // origin can be set to SEEK_SET or SEEK_CUR
 
-    unsigned long sb;
-    unsigned short i;
+    unsigned long sectors = FileSectorCount(file);
+    unsigned long cluster = file->cluster;
+    unsigned long current = file->sector;
+    unsigned long target;
 
-	if (origin == SEEK_CUR)
-		offset += file->sector;
-
-	if(offset > (file->size>>9))	// Attempt to seek beyond the end of the file
-	{
-		FatalError(ERROR_FILESYSTEM,"Seek() beyond end of file",file->sector,0);
-		return(0);
-	}
-
-    if (file->sector > offset) // current filepointer is beyond requested position
-    { // so move it backwards
-        if ((file->sector^offset) & cluster_mask) // moving backwards within current cluster?
-        { // different clusters, so go to the start of file
-            file->cluster = file->start_cluster;
-            file->sector = 0;
-        }
-        else
-        { // same clusters, move filepointer backwards within current cluster
-            file->sector = offset;
-        }
+    if (origin == SEEK_CUR)
+    {
+        if (current > sectors || offset > sectors - current)
+            return 0;
+        offset += current;
     }
-    
-    // moving forward
-    while ((file->sector^offset) & cluster_mask)  // compare clusters
-    { // different clusters, get next one
-        if (fat32)
-        {
-            sb = file->cluster >> 7; // calculate sector number containing FAT-link
-            i = file->cluster & 0x7F; // calculate link offsset within sector
-        }
-        else
-        {
-            sb = file->cluster >> 8; // calculate sector number containing FAT-link
-            i = file->cluster & 0xFF; // calculate link offsset within sector
-        }
-
-        if (sb != buffered_fat_index)
-        {
-            if (!MMC_Read(fat_start + sb, (unsigned char*)&fat_buffer)) // read sector of FAT if not already in the buffer
-                return(0);
-
-            buffered_fat_index = sb; // remember current buffer index
-        }
-
-        if (fat32)
-        {
-            file->cluster = SwapBBBB(fat_buffer.fat32[i]) & 0x0FFFFFFF; // get FAT32 link
-            if (file->cluster == 0x0FFFFFFF) // FAT32 EOC
-                return 0;
-        }
-        else
-        {
-            file->cluster = SwapBB(fat_buffer.fat16[i]); // get FAT16 link
-            if (file->cluster == 0xFFFF) // FAT16 EOC
-                return 0;
-        }
-
-        file->sector += cluster_size; // move file pointer to next cluster
+    if (exfat)
+        return ExfatSeek(file, offset);
+    if (offset > sectors)
+    {
+        FatalError(ERROR_FILESYSTEM, "Seek() beyond end of file", offset, sectors);
+        return 0;
     }
 
-    file->sector = offset; // same clusters
-
-    return(1);
+    target = offset;
+    if (sectors && !(file->size & 511))
+    {
+        if (current == sectors)
+            --current;
+        if (target == sectors)
+            --target;
+    }
+    current &= cluster_mask;
+    target &= cluster_mask;
+    if (current > target)
+    {
+        current = 0;
+        cluster = file->start_cluster;
+    }
+    while (current < target)
+    {
+        cluster = GetFATLink(cluster);
+        if (cluster < 2 || cluster >= (fat32 ? 0x0ffffff7UL : 0xfff7UL))
+            return 0;
+        current += cluster_size;
+    }
+    file->sector = offset;
+    file->cluster = cluster;
+    return 1;
 }
 
 #pragma section_code_init
 RAMFUNC unsigned int FileRead(fileTYPE *file, unsigned char *pBuffer) 
 {
     unsigned long sb;
+
+    if (exfat)
+    {
+        if (file->sector >= FileSectorCount(file) + ((file->size & 511) != 0) ||
+            !ExfatValidCluster(file->cluster))
+            return 0;
+        return MMC_Read(ExfatSector(file->cluster) + (file->sector & ~cluster_mask), pBuffer);
+    }
 
     sb = data_start;                         // start of data in partition
     sb += cluster_size * (file->cluster-2);  // cluster offset
@@ -1490,6 +1743,31 @@ unsigned int FileReadEx(fileTYPE *file, unsigned char *pBuffer, unsigned long nS
 {
     unsigned long sb;
     unsigned long bc; // block count of single multisector read operation
+
+    if (exfat)
+    {
+        unsigned long sectors = FileSectorCount(file);
+        /* Multi-sector transfers are used by HDFs and may go directly to the FPGA. */
+        if (file->sector > sectors || nSize > sectors - file->sector)
+            return 0;
+        while (nSize)
+        {
+            if (!ExfatValidCluster(file->cluster))
+                return 0;
+            bc = cluster_size - (file->sector & ~cluster_mask);
+            if (nSize < bc)
+                bc = nSize;
+            sb = ExfatSector(file->cluster) + (file->sector & ~cluster_mask);
+            if (bc == 1 ? !MMC_Read(sb, pBuffer) : !MMC_ReadMultiple(sb, pBuffer, bc))
+                return 0;
+            if (!ExfatSeek(file, file->sector + bc))
+                return 0;
+            if (pBuffer)
+                pBuffer += bc << 9;
+            nSize -= bc;
+        }
+        return 1;
+    }
 
     while (nSize)
     {
@@ -1517,6 +1795,14 @@ unsigned int FileWrite(fileTYPE *file,unsigned char *pBuffer)
 {
     unsigned long sector;
 
+    if (exfat)
+    {
+        if ((file->attributes & ATTR_READONLY) ||
+            file->sector >= FileSectorCount(file) + ((file->size & 511) != 0) || !ExfatValidCluster(file->cluster))
+            return 0;
+        return MMC_Write(ExfatSector(file->cluster) + (file->sector & ~cluster_mask), pBuffer);
+    }
+
     sector = data_start;                       // start of data in partition
     sector += cluster_size * (file->cluster-2);  // cluster offset
     sector += file->sector & ~cluster_mask;    // sector offset in cluster
@@ -1530,6 +1816,9 @@ unsigned int FileWrite(fileTYPE *file,unsigned char *pBuffer)
 
 unsigned int FileCreate(unsigned long iDirectory, fileTYPE *file)
 {
+    if (exfat || file->size_high)
+        return 0;
+
     // TODO: deleted entries are not empty, they have to be cleared first
     /*
     find empty dir entry
@@ -1690,6 +1979,9 @@ unsigned int FileCreate(unsigned long iDirectory, fileTYPE *file)
 // changing of allocated cluster number is not supported - new size must be within current cluster number
 unsigned int UpdateEntry(fileTYPE *file)
 {
+    if (exfat || file->size_high)
+        return 0;
+
     DIRENTRY *pEntry;
 
     if (!MMC_Read(file->entry.sector, sector_buffer))

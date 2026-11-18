@@ -86,6 +86,9 @@ clean:
 	@-rm $(PROJECT).bin
 	@-rm $(PROJECT).map
 
+$(ALL_SOURCES): fat.h
+$(BUILD_DIR)/fat.o: ../exfat.h
+
 %.asm: %.c
 	$(CC) $(CFLAGS) -o=$@ $<
 

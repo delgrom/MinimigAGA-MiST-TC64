@@ -127,6 +127,12 @@ int RAOpen(RAFile *file,const char *filename)
 	if(!file)
 		return(0);
 	result=FileOpen(&file->file,filename);
+    if (result && file->file.size_high)
+    {
+        SetError(ERROR_FILESYSTEM, "File is too large for byte access", 0, 0);
+        file->file.size = file->file.size_high = 0;
+        result = 0;
+    }
 	file->size=file->file.size;
 	file->ptr=0;
 	return(result);

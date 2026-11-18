@@ -66,6 +66,8 @@ bootdiag.h: bootdiag.s
 	vasmm68k_mot -Fbin bootdiag.s -o bootdiag.bin
 	xxd -i bootdiag.bin > bootdiag.h
 
+minfat.asm: ../exfat.h
+
 %.asm: %.c
 	$(CC) $(CFLAGS) -o=$@ $<
 

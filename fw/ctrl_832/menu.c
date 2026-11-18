@@ -922,8 +922,7 @@ void HandleUI(void)
             if (iCurrentDirectory) // if not root directory
             {
                 ScanDirectory(SCAN_INIT, fs_pFileExt, fs_Options);
-                ChangeDirectory(DirEntry[sort_table[iSelectedEntry]].StartCluster +
-						(fat32 ? (DirEntry[sort_table[iSelectedEntry]].HighCluster & 0x0FFF) << 16 : 0));
+                ChangeDirectory(DirectoryEntryCluster(&DirEntry[sort_table[iSelectedEntry]]));
                 if (ScanDirectory(SCAN_INIT_FIRST, fs_pFileExt, fs_Options))
                     ScanDirectory(SCAN_INIT_NEXT, fs_pFileExt, fs_Options);
 
@@ -1004,8 +1003,7 @@ void HandleUI(void)
         {
             if (DirEntry[sort_table[iSelectedEntry]].Attributes & ATTR_DIRECTORY)
             {
-                ChangeDirectory(DirEntry[sort_table[iSelectedEntry]].StartCluster +
-					(fat32 ? (DirEntry[sort_table[iSelectedEntry]].HighCluster & 0x0FFF) << 16 : 0));
+                ChangeDirectory(DirectoryEntryCluster(&DirEntry[sort_table[iSelectedEntry]]));
                 {
                     if (strncmp((char*)DirEntry[sort_table[iSelectedEntry]].Name, "..", 2) == 0)
                     { // parent dir selected
@@ -1038,10 +1036,9 @@ void HandleUI(void)
                     strncpy(file.long_name, DirEntryLFN[sort_table[iSelectedEntry]], len);
                     strncpy(DiskInfo, DirEntryInfo[iSelectedEntry], sizeof(DiskInfo));
 
-                    file.size = DirEntry[sort_table[iSelectedEntry]].FileSize;
+                    FileSetDirectorySize(&file, &DirEntry[sort_table[iSelectedEntry]]);
                     file.attributes = DirEntry[sort_table[iSelectedEntry]].Attributes;
-                    file.start_cluster = DirEntry[sort_table[iSelectedEntry]].StartCluster +
-						(fat32 ? (DirEntry[sort_table[iSelectedEntry]].HighCluster & 0x0FFF) << 16 : 0);
+                    file.start_cluster = DirectoryEntryCluster(&DirEntry[sort_table[iSelectedEntry]]);
                     file.cluster = file.start_cluster;
                     file.sector = 0;
 
@@ -2241,6 +2238,11 @@ void InsertFloppy(adfTYPE *drive)
     unsigned long tracks;
 
     // calculate number of tracks in the ADF image file
+    if (file.size_high)
+    {
+        SetError(ERROR_FDD, "ADF image too large", 0, 0);
+        return;
+    }
     tracks = file.size / (512*11);
     if (tracks > MAX_TRACKS)
     {

@@ -247,7 +247,7 @@ unsigned char CheckConfiguration(fileTYPE *cfgfile)
 	if(cfgfile)
 	{
 		configTYPE *tmpconf=(configTYPE *)&sector_buffer;
-        if (cfgfile->size <= sizeof(config))
+        if (!cfgfile->size_high && cfgfile->size <= sizeof(config))
         {
             if(FileRead(cfgfile, sector_buffer))
 			{
@@ -290,7 +290,7 @@ unsigned char LoadConfiguration(fileTYPE *cfgfile)
 		configTYPE *tmpconf=(configTYPE *)&sector_buffer;
 		BootPrint("Opened configuration file\n");
         printf("Configuration file size: %lu\r", cfgfile->size);
-        if (cfgfile->size <= sizeof(config))
+        if (!cfgfile->size_high && cfgfile->size <= sizeof(config))
         {
             FileRead(cfgfile, sector_buffer);
 
@@ -481,8 +481,9 @@ unsigned char SaveConfiguration(fileTYPE *cfgfile)
     // save configuration data
     if (cfgfile)
     {
-        if (file.size != sizeof(config))
+        if (file.size_high || file.size != sizeof(config))
         {
+            file.size_high = 0;
             file.size = sizeof(config);
             if (!UpdateEntry(&file))
                 return(0);
@@ -490,8 +491,7 @@ unsigned char SaveConfiguration(fileTYPE *cfgfile)
 
         memset((void*)&sector_buffer, 0, sizeof(sector_buffer));
         memcpy((void*)&sector_buffer, (void*)&config, sizeof(config));
-        FileWrite(&file, sector_buffer);
-        return(1);
+        return FileWrite(&file, sector_buffer);
     }
     else
     {
@@ -500,6 +500,7 @@ unsigned char SaveConfiguration(fileTYPE *cfgfile)
         printf("Trying to create a new one...\r");
         strncpy(file.name, configfilename, 11);
         file.attributes = 0;
+        file.size_high = 0;
         file.size = sizeof(config);
         printf("Config size is %x (%x) - address is %x\n",sizeof(config),file.size,&config);
         if (FileCreate(0, &file))
